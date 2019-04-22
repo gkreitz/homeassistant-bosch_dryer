@@ -3,10 +3,12 @@
 This is a quick n' dirty component for Home Assistant to read the state of a Bosch Dryer using Home Connect. It likely works with other Home Connect dryers too.
 
 This will give you four sensors for each Home Connect dryer you have:
-- `door`: open, close, locked, or unknown. https://developer.home-connect.com/docs/status/door_state
-- `program`: cotton, synthetic, ..., unknown. https://developer-staging.home-connect.com/docs/dryer/supported_programs_and_options
-- `remaining`: time remaining in seconds, or unknown.
-- `state`: inactive, ready, fun, finished, ..., or unavailable. https://developer.home-connect.com/docs/status/operation_state
+- **door**: `open`, `close`, `locked`, or `unknown`. https://developer.home-connect.com/docs/status/door_state
+- **program**: `cotton`, `synthetic`, ..., `unknown`. https://developer-staging.home-connect.com/docs/dryer/supported_programs_and_options
+- **remaining**: time remaining in seconds, or unknown.
+- **state**: `inactive`, `ready`, `fun`, `finished`, ..., or `unavailable`. https://developer.home-connect.com/docs/status/operation_state
+
+If the dryer is off/not connected to wifi, you'll get a **state** of `unavailable`` and the rest as ``unknown``.
 
 ## Automation ideas
 My plan for this is to add a task to empty the dryer in Todoist when the dryer is finished. When the door opens, that task is automatically completed.
@@ -18,7 +20,7 @@ In addition, when the dryer is running, Magic Mirror displays the time remaining
 - Copy this folder to `<config_dir>/custom_components/bosch_dryer/`.
 - Create an account on https://developer.home-connect.com/.
 - Register an application. Pick `Device flow` for OAuth flow.
-- Once you star this sequence, you have 5 minutes to complete it (or you'll have to restart from here):
+- Once you start this sequence, you have 5 minutes to complete it (or you'll have to restart from here):
   - `export CLIENT_ID="YOUR_CLIENT_ID"`
   - `curl -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "client_id=${CLIENT_ID}" https://api.home-connect.com/security/oauth/device_authorization | tee tmp.json`
   - Go to `verification_uri` in a browser, type in `user_code`. Log in using your (end user, not developer) Home Connect account and approve.
