@@ -6,7 +6,7 @@ This will give you four sensors for each Home Connect dryer you have:
 - **door**: `open`, `close`, `locked`, or `unknown`. https://developer.home-connect.com/docs/status/door_state
 - **program**: `cotton`, `synthetic`, ..., `unknown`. https://developer-staging.home-connect.com/docs/dryer/supported_programs_and_options
 - **remaining**: time remaining in seconds, or unknown.
-- **state**: `inactive`, `ready`, `fun`, `finished`, ..., or `unavailable`. https://developer.home-connect.com/docs/status/operation_state
+- **state**: `inactive`, `ready`, `run`, `finished`, ..., or `unavailable`. https://developer.home-connect.com/docs/status/operation_state
 
 If the dryer is off/not connected to wifi, you'll get a **state** of `unavailable`` and the rest as ``unknown``.
 
@@ -32,26 +32,10 @@ Put the following in your home assistant config:
 ```
 sensor:
   - platform: bosch_dryer
-    client_id: "YOUR_CLIENT_ID"
     refresh_token: "YOUR_REFRESH_TOKEN"
 ```
 
 ## Remarks on the API
-This is built using the Home Connect API, documented on https://developer.home-connect.com/. There is plenty in the API that is not exposed via this component. Using the API, one can also remote control the dryer, but I haven't figured out a use case for that yet. The API is a straightforward REST API with Oauth authentication. Best practice would likely be to only poll at startup and then use the streaming event API for updates. Instead, I just went with repeated state polling.
+This is built using the Home Connect API, documented on https://developer.home-connect.com/. There is plenty in the API that is not exposed via this component. Using the API, one can also remote control the dryer, but I haven't figured out a use case for that yet. The API is a straightforward REST API with Oauth authentication. There's also a server-side event feed giving pretty quick updates. Originally, this module was just polling, but I figured it'd be fun to test out asyncio, so I rewrote the module to be async and cloud-push.
 
-The API is a bit flakey, and tends to time out/return 504 during European evenings. I've written this component to retry all requests thrice to keep down the exception spam in the logs. Instead, you should expect to see warnings like:
-
-```
-2019-04-22 19:09:02 WARNING (MainThread) [homeassistant.helpers.entity] Update of sensor.bosch_wtwh75i9sn_state is taking over 10 seconds
-2019-04-22 19:09:23 WARNING (MainThread) [homeassistant.components.sensor] Updating bosch_dryer sensor took longer than the scheduled update interval 0:00:30
-```
-
-If you're unlucky, flakeyness will hit when the component refreshes its access token on startup. If so, you'll need to restart. I'll probably make it more robust if I get sufficiently annoyed by it. That error will have the following in the middle of a large exception block:
-```
-    raise TokenExpiredError()
-oauthlib.oauth2.rfc6749.errors.TokenExpiredError: (token_expired)
-
-During handling of the above exception, another exception occurred:
-...
-oauthlib.oauth2.rfc6749.errors.CustomOAuth2Error: (SDK.Error.504.GatewayTimeout) Timeout on Home Connect subsystem. Please try it again.
-```
+The API is a bit flakey, and tends to time out/return 504 during European evenings. Currently, this module retries forever, with an exponential backoff. I'll fix to something a tad better if/when I get sufficiently annoyed.

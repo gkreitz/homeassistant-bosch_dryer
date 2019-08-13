@@ -1,0 +1,8 @@
+{
+	"domain": "bosch_dryer",
+	"name": "Bosch Dryer",
+	"documentation": "https://github.com/gkreitz/homeassistant-bosch_dryer",
+	"dependencies": [],
+	"requirements": ["aiohttp-sse-client==0.1.6", "aiohttp==3.5.4"],
+	"codeowners": ["@gkreitz"]
+}

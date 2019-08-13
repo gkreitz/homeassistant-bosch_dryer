@@ -1,6 +1,7 @@
 import logging
 import json
 import datetime
+import asyncio
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 import homeassistant.helpers.config_validation as cv
@@ -10,20 +11,20 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle
 from homeassistant.const import (STATE_UNAVAILABLE, STATE_UNKNOWN)
 
+from homeassistant.helpers import aiohttp_client
+
 _LOGGER = logging.getLogger(__name__)
-REQUIREMENTS = ['requests-oauthlib==1.2.0']
+REQUIREMENTS = ['aiohttp-sse-client==0.1.6', 'aiohttp==3.5.4']
 
 DOMAIN = 'bosch_dryer'
 
-CONF_CLIENT_ID = 'client_id'
 CONF_REFRESH_TOKEN = 'refresh_token'
+CONF_TOKEN = 'bearer_token'
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_CLIENT_ID): cv.string,
     vol.Required(CONF_REFRESH_TOKEN): cv.string,
 })
 
-MIN_TIME_BETWEEN_UPDATES = datetime.timedelta(minutes=1)
 SENSOR_TYPES = ['door', 'program', 'remaining', 'state']
 BASE_URL = 'https://api.home-connect.com/'
 
@@ -34,52 +35,175 @@ def _build_api_url(suffix, haId=None):
         suffix = suffix[1:]
     return base_url + suffix.format(haid=haId)
 
-
-def _ignore_token_update(token):
-    # We need to supply a function to enable automatic usage of refresh tokens
-    pass
-
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    from requests_oauthlib import OAuth2Session
-    from requests.adapters import HTTPAdapter
-    from requests.packages.urllib3.util.retry import Retry
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    from aiohttp_sse_client import client as sse_client
+    import aiohttp
+    import multidict
 
     _LOGGER.debug("Starting Bosch Dryer sensor")
 
-    client_id = config.get(CONF_CLIENT_ID)
-    token = {'access_token': 'XXX',
-             'expires_in': -1,
-             'refresh_token': config.get(CONF_REFRESH_TOKEN),
-             'token_type': 'Bearer'
-            }
-    session = OAuth2Session(client_id=client_id,
-                            token=token,
-                            auto_refresh_url=BASE_URL+'security/oauth/token',
-                            token_updater=_ignore_token_update)
-    retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[500,502,504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('https://', adapter)
-    r = session.get(_build_api_url('/homeappliances'))
-    appliances = json.loads(r.content)['data']['homeappliances']
+    session = aiohttp_client.async_get_clientsession(hass)
+    auth_session = OauthSession(session, config.get(CONF_REFRESH_TOKEN))
+
+    headers = {'Accept': 'application/vnd.bsh.sdk.v1+json'}
+    appliances_response = await auth_session.get(_build_api_url('/homeappliances'), headers=headers)
+    appliances = appliances_response['data']['homeappliances']
+
     for a in appliances:
+        _LOGGER.debug('Found device %s', a)
         if a['type'] != 'Dryer':
             continue
+
         haId = a['haId']
-        reader = BoschDryerDataReader(session, a['haId'])
-        add_devices([BoschDryerSensorEntity(reader,
-                                            key,
-                                            a['brand'],
-                                            a['vib'],
-                                            key.capitalize()
-                                            )
-                     for key in SENSOR_TYPES])
+        _LOGGER.info('Found dryer %s', haId)
+        reader = BoschDryerDataReader(auth_session, a['haId'], hass)
+        hass.loop.create_task(reader.process_updates())
+
+        async_add_entities([BoschDryerSensorEntity(reader, key, a['brand'], a['vib'], key.capitalize()) for key in SENSOR_TYPES])
+
+class OauthSession:
+    def __init__(self, session, refresh_token):
+        self._session = session
+        self._refresh_token = refresh_token
+        self._access_token = None
+        self._fetching_new_token = None
+
+    @property
+    def session(self):
+        return self._session
+
+    async def token(self, old_token=None):
+        """ Returns an authorization header. If one is supplied as old_token, invalidate that one """
+        if self._access_token not in (None, old_token):
+            return self._access_token
+
+        if self._fetching_new_token is not None:
+            await self._fetching_new_token.wait()
+            return self._access_token
+
+        self._access_token = None
+        self._fetching_new_token = asyncio.Event()
+        data = { 'grant_type': 'refresh_token', 'refresh_token': self._refresh_token }
+        _LOGGER.debug('data: %s', data)
+        refresh_response = await self._http_request(BASE_URL + 'security/oauth/token', 'post', data=data)
+        if not 'access_token' in refresh_response:
+            _LOGGER.error('OAuth token refresh did not yield access token! Got back %s', refresh_response)
+        else:
+            self._access_token = 'Bearer ' + refresh_response['access_token']
+
+        self._fetching_new_token.set()
+        self._fetching_new_token = None
+        return self._access_token
+
+    async def get(self, url, **kwargs):
+        return await self._http_request(url, auth_token=self, **kwargs)
+
+    async def _http_request(self, url, method='get', auth_token=None, headers={}, **kwargs):
+        _LOGGER.debug('Making http %s request to %s, headers %s', method, url, headers)
+        headers = headers.copy()
+        tries = 0
+        while True:
+            if auth_token != None:
+                # Cache token so we know which token was used for this request,
+                # so we know if we need to invalidate.
+                token = await auth_token.token()
+                headers['Authorization'] = token
+            try:
+                async with self._session.request(method, url, headers=headers, **kwargs) as response:
+                    _LOGGER.debug('Http %s request to %s got response %d', method, url, response.status)
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 401 and auth_token != None:
+                        _LOGGER.debug('Request to %s returned status %d, refreshing auth token', url, response.status)
+                        token = await auth_token.token(token)
+                    else:
+                        _LOGGER.debug('Request to %s returned status %d', url, response.status)
+            except Exception as e:
+                _LOGGER.debug('Exception for http %s request to %s: %s', method, url, e)
+            tries += 1
+            await asyncio.sleep(min(600, 2**tries))
 
 
 class BoschDryerDataReader:
-    def __init__(self, session, haId):
-        self._session = session
+    def __init__(self, auth_session, haId, hass):
+        self._auth_session = auth_session
         self._haId = haId
         self._state = {}
+        self._sensors = []
+        self._hass = hass
+
+    def register_sensor(self, sensor):
+        self._sensors.append(sensor)
+
+    def handle_key_value(self, key, value):
+        updated = True
+        if key == 'DISCONNECTED':
+            self._state['state'] = STATE_UNAVAILABLE
+            self._state['door'] = STATE_UNKNOWN
+            self._state['program'] = STATE_UNKNOWN
+            self._state['remaining'] = STATE_UNKNOWN
+        elif key == 'BSH.Common.Status.DoorState':
+            self._state['door'] = value.replace('BSH.Common.EnumType.DoorState.', '').lower()
+        elif key == 'BSH.Common.Status.OperationState':
+            self._state['state'] = value.replace('BSH.Common.EnumType.OperationState.', '').lower()
+        elif key == 'BSH.Common.Root.SelectedProgram':
+            self._state['program'] = value.replace('LaundryCare.Dryer.Program.', '').lower()
+        elif key == 'BSH.Common.Option.RemainingProgramTime':
+            self._state['remaining'] = int(value)
+        else:
+            _LOGGER.debug('Ignored key-value pair: %s,%s', key, value)
+            updated = False
+
+        if updated:
+            for sensor in self._sensors:
+                sensor.async_schedule_update_ha_state()
+
+    async def process_updates(self):
+        from aiohttp_sse_client import client as sse_client
+        from aiohttp import ClientTimeout
+
+        _LOGGER.debug('Starting sse reader')
+        token = await self._auth_session.token()
+        headers = {'Accept-Language': 'en-US', 'Authorization': token}
+        tries = 0
+
+        while True:
+            try:
+                async with sse_client.EventSource(
+                        _build_api_url('/homeappliances/{haid}/events', self._haId),
+                        session=self._auth_session.session,
+                        headers=headers,
+                        timeout=ClientTimeout(total=None)
+                ) as event_source:
+                    self._hass.async_create_task(self.fetch_initial_state())
+                    async for event in event_source:
+                        tries = 0 # Reset backoff if we read any event successfully
+                        if event.type != 'KEEP-ALIVE':
+                            _LOGGER.debug('Received event: %s', event)
+                        if event.data:
+                            try:
+                                data = json.loads(event.data)
+                                for item in data['items']:
+                                    if 'key' in item and 'value' in item:
+                                        self.handle_key_value(item['key'], item['value'])
+                            except  Exception as e:
+                                _LOGGER.debug('SSE reader failed parsing %s', event.data)
+                        elif event.type == 'DISCONNECTED':
+                            self.handle_key_value('DISCONNECTED', '')
+                            pass
+                        elif event.type == 'CONNECTED':
+                            self._hass.async_create_task(self.fetch_initial_state())
+                            pass
+            except ConnectionError as ce:
+                _LOGGER.debug('SSE reader caught connection error: %s', ce)
+                if '401' in ce.args[0]: # Ugly way to extract http status
+                    token = await self._auth_session.token()
+                    headers['Authorization'] = token
+                tries += 1
+            except Exception as e:
+                _LOGGER.debug('SSE reader caught exception: %s', e)
+                tries += 1
+            await asyncio.sleep(min(600, 2**tries))
 
     @property
     def haId(self):
@@ -91,44 +215,27 @@ class BoschDryerDataReader:
             return self._state[key]
         return STATE_UNKNOWN
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
-        _LOGGER.debug("Bosch Dryer updating data")
+    async def fetch_initial_state(self):
+        _LOGGER.debug("Fetching initial state")
 
-        r = self._session.get(_build_api_url('/homeappliances/{haid}', self._haId))
-        s = json.loads(r.content)
-        if not s['data']['connected']:
-            self._state['state'] = STATE_UNAVAILABLE
-            self._state['door'] = STATE_UNKNOWN
-            self._state['program'] = STATE_UNKNOWN
-            self._state['remaining'] = STATE_UNKNOWN
+        headers = {'Accept': 'application/vnd.bsh.sdk.v1+json'}
+        state_response = await self._auth_session.get(_build_api_url('/homeappliances/{haid}', self._haId), headers=headers)
+        if not state_response['data']['connected']:
+            self.handle_key_value('DISCONNECTED', '')
             return
 
-        r = self._session.get(_build_api_url('/homeappliances/{haid}/status', self._haId))
-        s = json.loads(r.content)
-        for st in s['data']['status']:
-            if st['key'] == 'BSH.Common.Status.DoorState':
-                self._state['door'] = st['value'].replace('BSH.Common.EnumType.DoorState.', '').lower()
-            elif st['key'] == 'BSH.Common.Status.OperationState':
-                self._state['state'] = st['value'].replace('BSH.Common.EnumType.OperationState.', '').lower()
-        self._state['remaining'] = STATE_UNKNOWN
+        status_response = await self._auth_session.get(_build_api_url('/homeappliances/{haid}/status', self._haId), headers=headers)
+        for item in status_response['data']['status']:
+            self.handle_key_value(item['key'], item['value'])
 
-        program = STATE_UNKNOWN
-        if self._state['state'] not in ['inactive', 'ready']:
-            r = self._session.get(_build_api_url('/homeappliances/{haid}/programs/active', self._haId))
-            s = json.loads(r.content)
-            program = s['data']['key']
-            for st in s['data']['options']:
-                if st['key'] == 'BSH.Common.Option.RemainingProgramTime':
-                    self._state['remaining'] = int(st['value'])
-                    assert st['unit'] == 'seconds'
+        if self.get_data('state') not in ['inactive', 'ready', 'finished']:
+            program_response = await self._auth_session.get(_build_api_url('/homeappliances/{haid}/programs/active', self._haId), headers=headers)
+            self.handle_key_value('BSH.Common.Root.SelectedProgram', program_response['data']['key'])
+            for item in program_response['data']['options']:
+                self.handle_key_value(item['key'], item['value'])
         else:
-            r = self._session.get(_build_api_url('/homeappliances/{haid}/programs/selected', self._haId))
-            s = json.loads(r.content)
-            program = s['data']['key']
-        if program:
-            self._state['program'] = program.replace('LaundryCare.Dryer.Program.', '').lower()
-
+            program_response = await self._auth_session.get(_build_api_url('/homeappliances/{haid}/programs/selected', self._haId), headers=headers)
+            self.handle_key_value('BSH.Common.Root.SelectedProgram', program_response['data']['key'])
 
 class BoschDryerSensorEntity(Entity):
     def __init__(self, reader, key, brand, vib, name):
@@ -137,6 +244,7 @@ class BoschDryerSensorEntity(Entity):
         self._brand = brand
         self._vib = vib
         self._name = name
+        self._reader.register_sensor(self)
 
     @property
     def unique_id(self):
@@ -150,5 +258,6 @@ class BoschDryerSensorEntity(Entity):
     def state(self):
         return self._reader.get_data(self._key)
 
-    def update(self):
-        self._reader.update()
+    @property
+    def should_poll(self):
+        return False
