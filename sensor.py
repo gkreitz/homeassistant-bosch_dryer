@@ -197,7 +197,8 @@ class BoschDryerDataReader:
             except ConnectionError as ce:
                 _LOGGER.debug('SSE reader caught connection error: %s', ce)
                 if '401' in ce.args[0]: # Ugly way to extract http status
-                    token = await self._auth_session.token()
+                    _LOGGER.debug('Fetching new access token')
+                    token = await self._auth_session.token(headers['Authorization'])
                     headers['Authorization'] = token
                 tries += 1
             except Exception as e:
